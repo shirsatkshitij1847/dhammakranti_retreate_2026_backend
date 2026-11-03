@@ -69,6 +69,18 @@ Keep `JWT_SECRET` configured.
 
 ## Accounts and Permissions
 
+### Delete a pending signup
+
+`DELETE /api/accounts/waiting/:accountId` requires an admin token. Permanently
+deletes only an account whose current role is `visitor` (the waiting-list role),
+using an atomic role-filtered delete. Approved organizers/admins cannot be deleted
+through this endpoint. Returns `204` without a body, `400` for an invalid ID,
+`401/403` for missing/insufficient authorization, or `404` if no pending account
+matches (including an account already approved or deleted).
+Existing tokens for the deleted account stop working. Retreat participant records
+are separate and remain unchanged. No deletion email is sent. The admin waiting
+list requires confirmation before sending this request.
+
 Login accounts are separate from retreat registrations. Existing participants
 are not automatically login accounts. Registration email remains optional;
 account email and password are required. Account passwords are stored as bcrypt
@@ -410,7 +422,10 @@ Request body:
 ```json
 {
   "name": "Winter Retreat",
-  "year": 2027
+  "year": 2027,
+  "startDate": "2027-01-03",
+  "endDate": "2027-01-07",
+  "venue": "Retreat Centre, Akola"
 }
 ```
 
@@ -418,11 +433,24 @@ Request body:
 | ----- | ---- | -------- | ----- |
 | `name` | String | Yes | Non-empty; surrounding whitespace is trimmed |
 | `year` | Number | Yes | Integer, at least 2000 |
+| `startDate` | String | No (required in admin form) | Valid calendar date, `YYYY-MM-DD`; supply with `endDate` |
+| `endDate` | String | No (required in admin form) | Valid calendar date, `YYYY-MM-DD`; not before `startDate` |
+| `venue` | String | No (required in admin form) | Trimmed venue/address, maximum 300 characters |
 
 Success: `201 Created`. Returns the saved retreat document, including `_id` and timestamps.
 
 The same name/year combination must be unique. Different retreats can share a year.
 Use this endpoint for future years instead of creating a new database or collection.
+
+### Update retreat details
+
+**PATCH /api/retreats/:retreatId** requires an admin token and the same complete
+body as creation (including name/year). Returns `200` with the updated retreat,
+`400` for invalid fields/ID, `404` for a missing retreat, or `409` for duplicate
+name/year. Omitted dates and venue are cleared. Participant registrations are
+preserved. Use **Edit** in Retreat Setup to add details to existing retreats.
+Changes affect future confirmations only; emails already sent are not resent.
+Legacy retreats without dates or venue remain usable.
 
 ## 4. Register a Participant
 
@@ -645,3 +673,35 @@ For another retreat or year, create it through `POST /api/retreats`, then use it
 `_id` for registration. Delete a registration with `DELETE /api/users/<registration-id>`.
 Participant update endpoints are not currently implemented; account role updates
 are supported as described above.
+## Welcome and registration emails
+
+Email is sent by the backend only. Set `MAIL_ENABLED=true`, `SMTP_HOST`, `SMTP_PORT`,
+`SMTP_USER`, `SMTP_PASS`, and `MAIL_FROM` in the backend `.env` (see `.env.example`).
+For Gmail, use an app password, not the normal account password. Never use `VITE_`
+variables for mail credentials. Deploy the `mail-assets/` directory alongside `mail.js`.
+Email is disabled by default; restart the backend after configuring it.
+
+- New account signup sends a personalized welcome/approval-pending message.
+- Admin's first successful login while mail is enabled claims a persistent
+  `welcomeEmailAttemptedAt` marker and attempts a welcome email once. Concurrent
+  logins do not send duplicates. Failed attempts are logged and surfaced; automatic
+  retries are not implemented. Existing admin accounts receive it on their next login.
+- Retreat registration sends a confirmation only when an email was provided, after
+  the database transaction commits (never inside a transaction retry).
+  This separate participant message includes their full name, a heartfelt welcome,
+  the saved retreat name/year, inclusive start/end dates, and venue in both HTML
+  and plain text. Details come from the selected retreat, not registration input.
+  Missing dates/venue say "To be confirmed by the organizer"; no details are invented.
+  This confirms registration, not attendance or payment. SMTP must still be enabled.
+- HTML includes embedded logo/Buddha/stupa artwork, a plain-text alternative,
+  copyright, and the Triratna Youth Akola YouTube link. The layout uses a compact
+  left-aligned logo, dark green/gold palette, and a stupa backdrop under a dark
+  translucent layer. Buddha artwork sits beside the text and stacks above it on
+  mobile. Email clients that do not
+  support background images show the solid-color fallback.
+- Signup, first-admin-login, and registration responses include `emailNotification`
+  with `status`: `sent` (SMTP accepted, not a delivery guarantee), `disabled`,
+  `skipped` (no email), or `failed` with a safe message. Saving/login remains successful
+  when SMTP fails. Do not retry registration just because an email failed.
+- Delivery is synchronous with bounded SMTP timeouts; no durable queue/retry system
+  is provided. Passwords and tokens are never included in the email.

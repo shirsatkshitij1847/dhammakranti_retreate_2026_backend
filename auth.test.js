@@ -5,11 +5,13 @@ const { once } = require("node:events");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const nodemailer = require("nodemailer");
 
 process.env.JWT_SECRET = randomBytes(32).toString("hex");
 process.env.PORT = "3000";
 process.env.FRONTEND_URL = "https://frontend.example.test";
 process.env.BACKEND_URL = "https://backend.example.test";
+process.env.MAIL_ENABLED = "false";
 
 const app = require("./index");
 const { Account, bootstrapAdmin } = require("./auth");
@@ -19,13 +21,41 @@ const Retreat = mongoose.model("Retreat");
 test("authentication, permissions and existing APIs (mocked MongoDB)", async (t) => {
   const accounts = new Map();
   const registrations = new Map();
-  const retreat = { _id: new mongoose.Types.ObjectId(), name: "Retreat", year: 2026 };
+  const retreat = {
+    _id: new mongoose.Types.ObjectId(), name: "Retreat", year: 2026,
+    startDate: "2026-11-03", endDate: "2026-11-07", venue: "Akola Retreat Centre",
+  };
   const retreats = new Map([[String(retreat._id), retreat]]);
   const session = {};
   let failCascade = false;
+  let failMail = false;
+  let transactionActive = false;
+  const sentMail = [];
+  const mailSettings = ["MAIL_ENABLED", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM"];
+  const savedMailSettings = Object.fromEntries(mailSettings.map((key) => [key, process.env[key]]));
+  Object.assign(process.env, {
+    MAIL_ENABLED: "true", SMTP_HOST: "smtp.example.test", SMTP_PORT: "587",
+    SMTP_USER: "mock", SMTP_PASS: "mock-only", MAIL_FROM: "test@example.com",
+  });
+  t.after(() => {
+    for (const key of mailSettings) {
+      if (savedMailSettings[key] === undefined) delete process.env[key];
+      else process.env[key] = savedMailSettings[key];
+    }
+  });
+  t.mock.method(nodemailer, "createTransport", () => ({
+    async sendMail(mail) {
+      assert.equal(transactionActive, false);
+      assert.ok([...accounts.values(), ...registrations.values()].some((row) => row.email === mail.to));
+      sentMail.push(mail);
+      if (failMail) throw Object.assign(new Error("Mock SMTP unavailable"), { code: "ETIMEDOUT" });
+      return { accepted: [mail.to] };
+    },
+  }));
   t.mock.method(mongoose.connection, "transaction", async (callback) => {
     const savedRetreats = new Map(retreats);
     const savedRegistrations = new Map(registrations);
+    transactionActive = true;
     try {
       return await callback(session);
     } catch (error) {
@@ -34,6 +64,8 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
       for (const [id, row] of savedRetreats) retreats.set(id, row);
       for (const [id, row] of savedRegistrations) registrations.set(id, row);
       throw error;
+    } finally {
+      transactionActive = false;
     }
   });
   const password = "test-password-2026";
@@ -55,6 +87,20 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     return account;
   });
   t.mock.method(Account, "findById", async (id) => accounts.get(String(id)) || null);
+  t.mock.method(Account, "findOneAndDelete", async ({ _id, role }) => {
+    const account = accounts.get(String(_id));
+    if (!account || account.role !== role) return null;
+    accounts.delete(String(_id));
+    return account;
+  });
+  t.mock.method(Account, "findOneAndUpdate", async (filter, update, options) => {
+    assert.deepEqual(filter.welcomeEmailAttemptedAt, { $exists: false });
+    assert.equal(options.new, true);
+    const account = accounts.get(String(filter._id));
+    if (!account || account.welcomeEmailAttemptedAt) return null;
+    Object.assign(account, update.$set);
+    return account;
+  });
   t.mock.method(Account, "findOne", ({ email }) => {
     const account = [...accounts.values()].find((row) => row.email === email) || null;
     return {
@@ -85,6 +131,12 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     return account;
   });
   t.mock.method(Retreat, "findByIdAndUpdate", async (id, update, options) => {
+    if (!options.session) {
+      const row = retreats.get(String(id));
+      if (!row) return null;
+      Object.assign(row, update.$set);
+      return row;
+    }
     assert.equal(options.session, session);
     assert.deepEqual(update, { $inc: { registrationVersion: 1 } });
     return retreats.get(String(id)) || null;
@@ -106,6 +158,7 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     sort() { return Promise.resolve([retreat]); },
   }));
   t.mock.method(Retreat, "create", async (body) => {
+    await new Retreat(body).validate();
     createdRetreats++;
     return { ...retreat, ...body };
   });
@@ -196,6 +249,10 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     assert.equal(response.status, 201);
     const data = await response.json();
     visitor = data.account;
+    assert.equal(data.emailNotification.status, "sent");
+    assert.equal(sentMail.length, 1);
+    assert.equal(sentMail[0].to, visitor.email);
+    assert.ok(sentMail[0].text.includes("admin approval"));
     visitorToken = data.token;
     assert.equal(visitor.role, "visitor");
     assert.equal(visitor.email, "visitor@example.com");
@@ -243,6 +300,7 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
 
   await t.test("login handles correct, wrong and unknown credentials", async () => {
     adminToken = await login("admin@example.com");
+    assert.equal(sentMail.filter((mail) => mail.to === "admin@example.com").length, 1);
     for (const body of [
       { email: visitor.email, password: "wrong-password-2026" },
       { email: "unknown@example.com", password },
@@ -255,12 +313,21 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     await assert.rejects(bootstrapAdmin(), /non-admin/);
   });
 
+  await t.test("concurrent later admin logins do not repeat the welcome email", async () => {
+    const before = sentMail.length;
+    await Promise.all([login("admin@example.com"), login("admin@example.com")]);
+    assert.equal(sentMail.length, before);
+    const admin = [...accounts.values()].find((row) => row.role === "admin");
+    assert.ok(admin.welcomeEmailAttemptedAt instanceof Date);
+  });
+
   const protectedRoutes = [
     ["/api/retreats", "GET"],
     [`/api/retreats/${retreat._id}/registrations`, "POST"],
     ["/api/users", "GET"],
     ["/api/users/690000000000000000000002", "DELETE"],
     ["/api/retreats", "POST"],
+    [`/api/retreats/${retreat._id}`, "PATCH"],
     [`/api/retreats/${retreat._id}`, "DELETE"],
     [`/api/retreats/${retreat._id}/registrations`, "GET"],
     ["/api/accounts", "GET"],
@@ -308,21 +375,67 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
   });
 
   let participantId;
-  await t.test("authorized registration supports middle name and cannot assign account privileges", async () => {
+  await t.test("registration stays saved on mail failure and cannot assign account privileges", async (t) => {
     const fields = {
       name: "Sample", middleName: " Middle ", surname: "Participant",
       mobileNumber: "9000000000", center: "Akola", centerPayment: "500", address: "Akola",
+      email: "participant@example.com",
     };
     const path = `/api/retreats/${retreat._id}/registrations`;
+    failMail = true;
+    t.mock.method(console, "error", () => {});
     const response = await request(path, { method: "POST", token: adminToken, body: fields });
+    failMail = false;
     assert.equal(response.status, 201);
     const data = await response.json();
     participantId = data._id;
+    assert.equal(data.emailNotification.status, "failed");
+    assert.ok(registrations.has(participantId));
+    assert.equal(sentMail.at(-1).to, fields.email);
+    assert.ok(sentMail.at(-1).text.includes("Sample Middle Participant"));
+    assert.ok(sentMail.at(-1).text.includes("Retreat: Retreat"));
+    assert.ok(sentMail.at(-1).text.includes("3 November 2026"));
+    assert.ok(sentMail.at(-1).text.includes("7 November 2026"));
+    assert.ok(sentMail.at(-1).text.includes("Akola Retreat Centre"));
+    const success = await request(path, { method: "POST", token: adminToken, body: fields });
+    const successData = await success.json();
+    assert.equal(success.status, 201);
+    assert.equal(successData.emailNotification.status, "sent");
+    registrations.delete(successData._id);
+    const count = sentMail.length;
+    const noEmail = await request(path, { method: "POST", token: adminToken, body: { ...fields, email: "" } });
+    const noEmailData = await noEmail.json();
+    assert.equal(noEmail.status, 201);
+    assert.equal(noEmailData.emailNotification.status, "skipped");
+    assert.equal(sentMail.length, count);
+    registrations.delete(noEmailData._id);
     assert.equal(data.role, "visitor");
     assert.equal(data.middleName, "Middle");
     const elevated = await request(path, { method: "POST", token: adminToken, body: { ...fields, role: "admin" } });
     assert.equal(elevated.status, 400);
     assert.equal(accounts.size, 2);
+  });
+
+  await t.test("admins can save retreat dates and venue; invalid dates and other roles are rejected", async () => {
+    const path = `/api/retreats/${retreat._id}`;
+    const fields = {
+      name: retreat.name, year: retreat.year, startDate: "2026-11-03",
+      endDate: "2026-11-07", venue: "Akola Retreat Centre",
+    };
+    assert.equal((await request(path, { method: "PATCH", body: fields })).status, 401);
+    assert.equal((await request(path, { method: "PATCH", token: visitorToken, body: fields })).status, 403);
+    for (const invalid of [
+      { startDate: "2026-02-30" }, { endDate: "2026-11-01" },
+      { startDate: "" }, { venue: "a".repeat(301) },
+    ]) {
+      assert.equal((await request(path, { method: "PATCH", token: adminToken, body: { ...fields, ...invalid } })).status, 400);
+    }
+    const saved = await request(path, { method: "PATCH", token: adminToken, body: fields });
+    assert.equal(saved.status, 200);
+    assert.equal((await saved.json()).venue, fields.venue);
+    assert.equal((await request(`/api/retreats/${new mongoose.Types.ObjectId()}`, {
+      method: "PATCH", token: adminToken, body: fields,
+    })).status, 404);
   });
 
   await t.test("admin can list, create retreats and manage organizer roles; live roles override old tokens", async () => {
@@ -511,5 +624,41 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     }
     assert.equal(response.status, 429);
     assert.match((await response.json()).error, /Too many/);
+  });
+
+  await t.test("only admins delete pending signup accounts, invalidating tokens without deleting participants", async () => {
+    const pending = await Account.create({
+      name: "Pending Signup", email: "pending@example.test",
+      passwordHash: "test-only-hash", role: "visitor",
+    });
+    const path = `/api/accounts/waiting/${pending._id}`;
+    const pendingToken = jwt.sign({ tokenVersion: pending.tokenVersion }, process.env.JWT_SECRET, {
+      algorithm: "HS256", subject: String(pending._id), issuer: "triratnaAkola",
+      audience: "retreat-api", expiresIn: "1h",
+    });
+    const participantCount = registrations.size;
+    assert.equal((await request(path, { method: "DELETE" })).status, 401);
+    assert.equal((await request(path, { method: "DELETE", token: pendingToken })).status, 403);
+    const originalRole = accounts.get(visitor._id).role;
+    accounts.get(visitor._id).role = "organizer";
+    const organizerToken = jwt.sign({ tokenVersion: accounts.get(visitor._id).tokenVersion }, process.env.JWT_SECRET, {
+      subject: visitor._id, issuer: "triratnaAkola", audience: "retreat-api", expiresIn: "1h",
+    });
+    assert.equal((await request(path, { method: "DELETE", token: organizerToken })).status, 403);
+    assert.equal((await request(`/api/accounts/waiting/${visitor._id}`, { method: "DELETE", token: adminToken })).status, 404);
+    accounts.get(visitor._id).role = originalRole;
+    const admin = [...accounts.values()].find((row) => row.role === "admin");
+    assert.equal((await request(`/api/accounts/waiting/${admin._id}`, { method: "DELETE", token: adminToken })).status, 404);
+    assert.equal((await request("/api/accounts/waiting/invalid", { method: "DELETE", token: adminToken })).status, 400);
+    assert.equal((await request(`/api/accounts/waiting/${new mongoose.Types.ObjectId()}`, { method: "DELETE", token: adminToken })).status, 404);
+    const deleted = await request(path, { method: "DELETE", token: adminToken });
+    assert.equal(deleted.status, 204);
+    assert.equal(await deleted.text(), "");
+    assert.equal(accounts.has(String(pending._id)), false);
+    assert.equal((await request("/api/profile", { token: pendingToken })).status, 401);
+    assert.equal(registrations.size, participantCount);
+    assert.equal((await request(path, { method: "DELETE", token: adminToken })).status, 404);
+    const waiting = await request("/api/accounts/waiting", { token: adminToken });
+    assert.ok(!(await waiting.json()).some((row) => row._id === String(pending._id)));
   });
 });

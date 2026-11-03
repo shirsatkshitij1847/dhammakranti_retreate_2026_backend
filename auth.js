@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { rateLimit } = require("express-rate-limit");
+const { sendWelcome, mailEnabled } = require("./mail");
 
 const roles = ["visitor", "organizer", "admin"];
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -19,6 +20,7 @@ const accountSchema = new mongoose.Schema(
     },
     passwordHash: { type: String, required: true, select: false },
     tokenVersion: { type: Number, default: 0 },
+    welcomeEmailAttemptedAt: { type: Date },
     role: { type: String, enum: roles, default: "visitor", required: true },
   },
   { timestamps: true },
@@ -170,7 +172,8 @@ router.post("/signup", loginLimiter, async (request, response) => {
     passwordHash: await bcrypt.hash(password, 12),
     role: "visitor",
   });
-  response.status(201).json(loginResponse(account));
+  const emailNotification = await sendWelcome({ email: account.email, name: account.name, kind: "signup" });
+  response.status(201).json({ ...loginResponse(account), emailNotification });
 });
 
 router.post("/login", loginLimiter, async (request, response) => {
@@ -190,7 +193,16 @@ router.post("/login", loginLimiter, async (request, response) => {
     return response.status(401).json({ error: "Invalid email or password" });
   }
 
-  response.json(loginResponse(account));
+  let emailNotification;
+  if (account.role === "admin" && mailEnabled()) {
+    const claimed = await Account.findOneAndUpdate(
+      { _id: account._id, welcomeEmailAttemptedAt: { $exists: false } },
+      { $set: { welcomeEmailAttemptedAt: new Date() } },
+      { new: true },
+    );
+    if (claimed) emailNotification = await sendWelcome({ email: account.email, name: account.name, kind: "admin" });
+  }
+  response.json({ ...loginResponse(account), ...(emailNotification ? { emailNotification } : {}) });
 });
 
 router.get("/me", authenticate, (request, response) => {
