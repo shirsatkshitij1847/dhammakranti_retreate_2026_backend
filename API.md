@@ -696,17 +696,24 @@ Participant update endpoints are not currently implemented; account role updates
 are supported as described above.
 ## Welcome and registration emails
 
-Email is sent by the backend only. Set `MAIL_ENABLED=true`, `SMTP_HOST`, `SMTP_PORT`,
-`SMTP_USER`, `SMTP_PASS`, and `MAIL_FROM` in the backend `.env` (see `.env.example`).
-For Gmail, use an app password, not the normal account password. Never use `VITE_`
+Email is sent by the backend only. For Gmail, set `MAIL_ENABLED=true`, `EMAIL`
+(your Gmail address), and `APP_PASS` (a Gmail app password) in the backend `.env`.
+This uses `smtp.gmail.com`, port `587` with STARTTLS, and sends from `EMAIL`.
+Alternatively, configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and
+`MAIL_FROM` (see `.env.example`); these settings override the Gmail defaults.
+Use an app password, not the normal Gmail account password. Never use `VITE_`
 variables for mail credentials. Deploy the `mail-assets/` directory alongside `mail.js`.
 Email is disabled by default; restart the backend after configuring it.
 
 - New account signup sends a personalized welcome/approval-pending message.
-- Admin's first successful login while mail is enabled claims a persistent
+- An admin or organizer's first successful login while mail is enabled claims a persistent
   `welcomeEmailAttemptedAt` marker and attempts a welcome email once. Concurrent
   logins do not send duplicates. Failed attempts are logged and surfaced; automatic
-  retries are not implemented. Existing admin accounts receive it on their next login.
+  retries are not implemented. Existing admin/organizer accounts without the marker
+  receive it on their next login. This is once per account, not once per role:
+  promoting an organizer to admin does not send another first-login email.
+  Organizer messages welcome the approved team member; signup messages remain
+  approval-pending. Logins while mail is disabled do not consume the marker.
 - Retreat registration sends a confirmation only when an email was provided, after
   the database transaction commits (never inside a transaction retry).
   This separate participant message includes their full name, a heartfelt welcome,
@@ -715,12 +722,17 @@ Email is disabled by default; restart the backend after configuring it.
   Missing dates/venue say "To be confirmed by the organizer"; no details are invented.
   This confirms registration, not attendance or payment. SMTP must still be enabled.
 - HTML includes embedded logo/Buddha/stupa artwork, a plain-text alternative,
-  copyright, and the Triratna Youth Akola YouTube link. The layout uses a compact
-  left-aligned logo, dark green/gold palette, and a stupa backdrop under a dark
-  translucent layer. Buddha artwork sits beside the text and stacks above it on
-  mobile. Email clients that do not
+  copyright, the Triratna Youth Akola YouTube link, and a "Stay connected with
+  Dhammakranti" link to `https://dhammakranti.triratnaakolayouth.com` in both HTML
+  and plain text. The layout uses a compact
+  left-aligned logo, dark green/gold palette, serif headings, and a stupa backdrop
+  under a dark translucent layer. Larger portrait Buddha artwork sits beside the
+  text and stacks above it on mobile. Its transparent, feathered edges are baked
+  into `mail-assets/buddha-blended.png`, so blending does not depend on email-client
+  support for CSS masks or blend modes. Deploy this asset with the other artwork.
+  Email clients that do not
   support background images show the solid-color fallback.
-- Signup, first-admin-login, and registration responses include `emailNotification`
+- Signup, first-admin/organizer-login attempts, and registration responses include `emailNotification`
   with `status`: `sent` (SMTP accepted, not a delivery guarantee), `disabled`,
   `skipped` (no email), or `failed` with a safe message. Saving/login remains successful
   when SMTP fails. Do not retry registration just because an email failed.

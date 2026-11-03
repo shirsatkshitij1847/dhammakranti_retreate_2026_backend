@@ -164,7 +164,7 @@ app.post("/api/retreats", authenticate, requireAdmin, async (request, response) 
     year: request.body.year,
     startDate: request.body.startDate,
     endDate: request.body.endDate,
-    venue: request.body.venue,
+    venue: readquest.body.venue,
   });
   response.status(201).json(retreat);
 });

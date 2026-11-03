@@ -616,6 +616,74 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     assert.equal((await request("/api/accounts", { token: adminToken })).status, 200);
   });
 
+  await t.test("organizer first login sends once after approval, not during disabled or invalid logins", async (t) => {
+    // Give the additional login coverage a fresh 15-minute rate-limit window.
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 16 * 60 * 1000 });
+    const account = await Account.create({
+      name: "Team Member", email: "team@example.test", role: "organizer",
+      passwordHash: [...accounts.values()].find((row) => row.role === "admin").passwordHash,
+    });
+    try {
+      const before = sentMail.length;
+      const invalid = await request("/api/auth/login", {
+        method: "POST", body: { email: account.email, password: "wrong-password" },
+      });
+      assert.equal(invalid.status, 401);
+      assert.equal(account.welcomeEmailAttemptedAt, undefined);
+      process.env.MAIL_ENABLED = "false";
+      await login(account.email);
+      assert.equal(account.welcomeEmailAttemptedAt, undefined);
+      assert.equal(sentMail.length, before);
+      process.env.MAIL_ENABLED = "true";
+      const responses = await Promise.all([1, 2].map(() => request("/api/auth/login", {
+        method: "POST", body: { email: account.email, password },
+      })));
+      assert.ok(responses.every((response) => response.status === 200));
+      const results = await Promise.all(responses.map((response) => response.json()));
+      assert.equal(results.filter((result) => result.emailNotification?.status === "sent").length, 1);
+      assert.equal(sentMail.length, before + 1);
+      assert.equal(sentMail.at(-1).to, account.email);
+      assert.ok(sentMail.at(-1).text.includes("organization team"));
+      assert.ok(account.welcomeEmailAttemptedAt instanceof Date);
+      account.role = "admin";
+      await login(account.email);
+      assert.equal(sentMail.length, before + 1);
+    } finally {
+      process.env.MAIL_ENABLED = "true";
+      accounts.delete(String(account._id));
+    }
+  });
+
+  await t.test("first team login remains successful on mail failure and does not repeat the attempt", async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 32 * 60 * 1000 });
+    t.mock.method(console, "error", () => {});
+    for (const role of ["admin", "organizer"]) {
+      const account = await Account.create({
+        name: "New Team Member", email: `new-${role}@example.test`, role,
+        passwordHash: [...accounts.values()].find((row) => row.role === "admin").passwordHash,
+      });
+      try {
+        const before = sentMail.length;
+        failMail = true;
+        const response = await request("/api/auth/login", {
+          method: "POST", body: { email: account.email, password },
+        });
+        assert.equal(response.status, 200);
+        const data = await response.json();
+        assert.equal(data.emailNotification.status, "failed");
+        assert.ok(data.token);
+        assert.equal(data.account.role, role);
+        assert.ok(account.welcomeEmailAttemptedAt instanceof Date);
+        failMail = false;
+        await login(account.email);
+        assert.equal(sentMail.length, before + 1);
+      } finally {
+        failMail = false;
+        accounts.delete(String(account._id));
+      }
+    }
+  });
+
   await t.test("authentication attempts are rate limited with JSON errors", async () => {
     let response;
     for (let attempt = 0; attempt < 21; attempt++) {

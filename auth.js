@@ -194,13 +194,13 @@ router.post("/login", loginLimiter, async (request, response) => {
   }
 
   let emailNotification;
-  if (account.role === "admin" && mailEnabled()) {
+  if (["admin", "organizer"].includes(account.role) && mailEnabled()) {
     const claimed = await Account.findOneAndUpdate(
       { _id: account._id, welcomeEmailAttemptedAt: { $exists: false } },
       { $set: { welcomeEmailAttemptedAt: new Date() } },
       { new: true },
     );
-    if (claimed) emailNotification = await sendWelcome({ email: account.email, name: account.name, kind: "admin" });
+    if (claimed) emailNotification = await sendWelcome({ email: account.email, name: account.name, kind: account.role });
   }
   response.json({ ...loginResponse(account), ...(emailNotification ? { emailNotification } : {}) });
 });
