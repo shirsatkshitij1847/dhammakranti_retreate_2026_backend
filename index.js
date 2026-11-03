@@ -3,11 +3,11 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
-const { port, frontendUrl, backendUrl } = require("./config");
+const { port, frontendUrl, backendUrl } = require("./config.js");
 const {
   Account, router: authRouter, authenticate, requireAdmin, requireOrganizer,
   bootstrapAdmin, publicAccount, roles, resetAccountPassword,
-} = require("./auth");
+} = require("./auth.js");
 
 const app = express();
 

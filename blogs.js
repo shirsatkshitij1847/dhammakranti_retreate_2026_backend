@@ -2,8 +2,8 @@ const express = require("express");
 const mongoose = require("mongoose");
 const multer = require("multer");
 const sharp = require("sharp");
-const { authenticate, requireOrganizer } = require("./auth");
-const { backendUrl } = require("./config");
+const { authenticate, requireOrganizer } = require("./auth.js");
+const { backendUrl } = require("./config.js");
 
 const imageLimit = 5 * 1024 * 1024;
 const blogSchema = new mongoose.Schema(
