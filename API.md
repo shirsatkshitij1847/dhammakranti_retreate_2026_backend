@@ -9,6 +9,7 @@ Set these variables in `.env` (see [.env.example](./.env.example)), then run:
 | `MONGO_URL` | MongoDB connection string |
 | `PORT` | Required listening port, e.g. `3000` |
 | `FRONTEND_URL` | Required allowed frontend origin, e.g. `http://localhost:5173` |
+| `CORS_ADDITIONAL_ORIGINS` | Optional comma-separated additional frontend origins; no wildcards or paths |
 | `BACKEND_URL` | Required public backend origin, e.g. `http://localhost:3000`; used for image links |
 | `JWT_SECRET` | Required random secret, at least 32 bytes; keep private |
 | `ADMIN_EMAIL` | First admin's email address |
@@ -40,6 +41,26 @@ URL variables must be HTTP(S) origins without paths, queries, or fragments.
 For example, use `http://localhost:5173`, not `http://localhost:5173/#registration`.
 Restart the backend after changing its environment. Behind a reverse proxy,
 `BACKEND_URL` is the public origin and can use a different port from `PORT`.
+
+Production configuration:
+
+```dotenv
+PORT=7004
+FRONTEND_URL=https://dhammakranti.triratnaakolayouth.com
+CORS_ADDITIONAL_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+BACKEND_URL=https://dhammakrantiretreat.triratnaakolayouth.com
+```
+
+Terminate HTTPS at the reverse proxy and forward the backend domain to the API
+on port `7004`. The frontend must use
+`VITE_API_BASE_URL=https://dhammakrantiretreat.triratnaakolayouth.com`, without
+`:7004`. CORS allows the frontend origin above, including preflight requests
+with JSON content and the Authorization header. Restart the backend and rebuild
+the frontend after configuration changes.
+The additional origins allow local Vite development against the production API.
+Other origins do not receive CORS permission. Clear `CORS_ADDITIONAL_ORIGINS`
+to allow only the production frontend. CORS is enforced by the backend, not by
+frontend JavaScript.
 
 ### Frontend API base URL (Vite)
 

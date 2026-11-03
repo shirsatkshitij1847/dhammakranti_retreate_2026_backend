@@ -1,7 +1,6 @@
 require("dotenv").config({ quiet: true });
 
-function origin(name) {
-  const value = process.env[name];
+function origin(name, value = process.env[name]) {
   if (!value) throw new Error(`${name} is required`);
   let url;
   try {
@@ -21,8 +20,18 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("PORT must be an integer from 1 to 65535");
 }
 
+const frontendUrl = origin("FRONTEND_URL");
+const additionalOrigins = process.env.CORS_ADDITIONAL_ORIGINS?.trim();
+const allowedFrontendOrigins = [...new Set([
+  frontendUrl,
+  ...(additionalOrigins
+    ? additionalOrigins.split(",").map((value) => origin("CORS_ADDITIONAL_ORIGINS", value.trim()))
+    : []),
+])];
+
 module.exports = {
   port,
-  frontendUrl: origin("FRONTEND_URL"),
+  frontendUrl,
+  allowedFrontendOrigins,
   backendUrl: origin("BACKEND_URL"),
 };

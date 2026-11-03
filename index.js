@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const { sendWelcome } = require("./mail");
-const { port, frontendUrl, backendUrl } = require("./config.js");
+const { port, allowedFrontendOrigins, backendUrl } = require("./config.js");
 const {
   Account, router: authRouter, authenticate, requireAdmin, requireOrganizer,
   bootstrapAdmin, publicAccount, roles, resetAccountPassword,
@@ -12,7 +12,7 @@ const {
 
 const app = express();
 
-app.use(cors({ origin: frontendUrl }));
+app.use(cors({ origin: allowedFrontendOrigins }));
 app.use(express.json());
 app.use("/api/auth", authRouter);
 app.use("/api/blogs", require("./blogs"));
