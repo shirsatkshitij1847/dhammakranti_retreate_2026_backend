@@ -13,9 +13,9 @@ function createMessage({ name, kind, retreat }) {
   const message = registration
     ? "Thank you for registering and choosing to share this retreat with us. In the midst of everyday life, taking time to pause, breathe, and turn towards the Dhamma is a meaningful gift to yourself. Your presence will bring warmth to our circle of friendship, and we look forward to welcoming you."
     : kind === "admin"
-      ? "Thank you for your first visit as an administrator. Your care helps our community grow through friendship, wisdom, and compassion."
+      ? "Welcome as an administrator. Your care helps our community grow through friendship, wisdom, and compassion."
       : kind === "organizer"
-        ? "Welcome to our organization team! Thank you for your first visit as an organizer. Your account is approved, and we look forward to working together to welcome participants and support our retreat community."
+        ? "Welcome to our organization team! Your account is approved, and we look forward to working together to welcome participants and support our retreat community."
         : "Thank you for visiting Triratna Akola and creating your account. Your request has been sent for admin approval. Please log in again after your account is approved.";
   const closing = "May your journey be filled with peace, kindness, and meaningful connection.";
   const website = "https://dhammakranti.triratnaakolayouth.com";
@@ -116,7 +116,7 @@ async function sendWelcome({ email, name, kind, retreat }) {
     return { status: "sent" };
   } catch (error) {
     console.error("Welcome email delivery failed:", error.code || "MAIL_FAILURE");
-    return { status: "failed", message: "Your details were saved, but the welcome email could not be sent. Please contact the organizer; do not submit again." };
+    return { status: "failed", message: "The email could not be sent. Please try the email request again later; do not submit another registration or signup." };
   }
 }
 

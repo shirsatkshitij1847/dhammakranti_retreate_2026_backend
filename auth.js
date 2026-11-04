@@ -20,7 +20,8 @@ const accountSchema = new mongoose.Schema(
     },
     passwordHash: { type: String, required: true, select: false },
     tokenVersion: { type: Number, default: 0 },
-    welcomeEmailAttemptedAt: { type: Date },
+    adminWelcomeEmailAttemptedAt: { type: Date },
+    organizerWelcomeEmailAttemptedAt: { type: Date },
     role: { type: String, enum: roles, default: "visitor", required: true },
   },
   { timestamps: true },
@@ -62,6 +63,28 @@ function publicAccount(account) {
     email: account.email,
     role: account.role,
   };
+}
+
+async function sendAccountWelcome(account) {
+  if (account.role === "visitor") {
+    return sendWelcome({ email: account.email, name: account.name, kind: "signup" });
+  }
+  if (!mailEnabled()) return { status: "disabled" };
+  const marker = account.role === "admin"
+    ? "adminWelcomeEmailAttemptedAt"
+    : "organizerWelcomeEmailAttemptedAt";
+  // Claim before SMTP so simultaneous login, approval and manual requests cannot resend.
+  const claimed = await Account.findOneAndUpdate(
+    { _id: account._id, role: account.role, [marker]: { $exists: false } },
+    { $set: { [marker]: new Date() } },
+    { new: true },
+  );
+  if (!claimed) return { status: "already_attempted" };
+  const result = await sendWelcome({ email: claimed.email, name: claimed.name, kind: claimed.role });
+  if (result.status === "failed") {
+    return { ...result, message: "The welcome email could not be sent. This role's one-time attempt has been recorded; no further welcome email will be sent for this role." };
+  }
+  return result;
 }
 
 function loginResponse(account) {
@@ -172,7 +195,7 @@ router.post("/signup", loginLimiter, async (request, response) => {
     passwordHash: await bcrypt.hash(password, 12),
     role: "visitor",
   });
-  const emailNotification = await sendWelcome({ email: account.email, name: account.name, kind: "signup" });
+  const emailNotification = await sendAccountWelcome(account);
   response.status(201).json({ ...loginResponse(account), emailNotification });
 });
 
@@ -193,15 +216,7 @@ router.post("/login", loginLimiter, async (request, response) => {
     return response.status(401).json({ error: "Invalid email or password" });
   }
 
-  let emailNotification;
-  if (["admin", "organizer"].includes(account.role) && mailEnabled()) {
-    const claimed = await Account.findOneAndUpdate(
-      { _id: account._id, welcomeEmailAttemptedAt: { $exists: false } },
-      { $set: { welcomeEmailAttemptedAt: new Date() } },
-      { new: true },
-    );
-    if (claimed) emailNotification = await sendWelcome({ email: account.email, name: account.name, kind: account.role });
-  }
+  const emailNotification = account.role === "admin" ? await sendAccountWelcome(account) : undefined;
   response.json({ ...loginResponse(account), ...(emailNotification ? { emailNotification } : {}) });
 });
 
@@ -248,5 +263,6 @@ module.exports = {
   resetAccountPassword,
   bootstrapAdmin,
   publicAccount,
+  sendAccountWelcome,
   roles,
 };

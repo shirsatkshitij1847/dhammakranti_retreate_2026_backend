@@ -2,6 +2,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const multer = require("multer");
 const sharp = require("sharp");
+const sanitizeHtml = require("sanitize-html");
 const { authenticate, requireOrganizer } = require("./auth.js");
 const { backendUrl } = require("./config.js");
 
@@ -10,6 +11,7 @@ const blogSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, trim: true, maxlength: 200 },
     text: { type: String, required: true, trim: true, maxlength: 20000 },
+    textFormat: { type: String, enum: ["plain", "html"], default: "plain" },
     authorId: { type: mongoose.Schema.Types.ObjectId, ref: "Account", required: true },
     image: { type: Buffer, required: true, select: false },
   },
@@ -19,7 +21,7 @@ const Blog = mongoose.model("Blog", blogSchema);
 const router = express.Router();
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: imageLimit, files: 1, fields: 2, fieldSize: 80000, parts: 3 },
+  limits: { fileSize: imageLimit, files: 1, fields: 3, fieldSize: 80000, parts: 4 },
 }).single("image");
 
 function details(blog) {
@@ -27,6 +29,7 @@ function details(blog) {
     _id: blog._id,
     title: blog.title,
     text: blog.text,
+    textFormat: blog.textFormat || "plain",
     authorId: blog.authorId,
     imageUrl: `${backendUrl}/api/blogs/${blog._id}/image`,
     createdAt: blog.createdAt,
@@ -100,6 +103,33 @@ async function saveBlog(request, response) {
         return response.status(400).json({ error: `${field} is required and must be at most ${max} characters` });
       }
       updates[field] = value.trim();
+    }
+  }
+  const textFormat = request.body?.textFormat;
+  if (textFormat !== undefined && !["plain", "html"].includes(textFormat)) {
+    return response.status(400).json({ error: "textFormat must be plain or html" });
+  }
+  if (textFormat !== undefined && updates.text === undefined) {
+    return response.status(400).json({ error: "Provide text when changing textFormat" });
+  }
+  if (updates.text !== undefined) {
+    updates.textFormat = textFormat || request.blog?.textFormat || "plain";
+    if (updates.textFormat === "html") {
+      updates.text = sanitizeHtml(updates.text, {
+        allowedTags: ["p", "br", "strong", "b", "em", "i", "h2", "h3", "ul", "ol", "li", "blockquote"],
+        allowedAttributes: { p: ["data-spacing"] },
+        transformTags: {
+          p: (tagName, attributes) => ({
+            tagName,
+            attribs: ["compact", "normal", "wide"].includes(attributes["data-spacing"])
+              ? { "data-spacing": attributes["data-spacing"] } : {},
+          }),
+        },
+      });
+      if (!sanitizeHtml(updates.text, { allowedTags: [], allowedAttributes: {} })
+        .replace(/&nbsp;|&#160;/g, " ").trim() || updates.text.length > 20000) {
+        return response.status(400).json({ error: "Formatted text must contain readable content and be at most 20000 characters" });
+      }
     }
   }
   if (isNew && !request.file) {

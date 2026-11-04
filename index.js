@@ -7,7 +7,7 @@ const { sendWelcome } = require("./mail");
 const { port, allowedFrontendOrigins, backendUrl } = require("./config.js");
 const {
   Account, router: authRouter, authenticate, requireAdmin, requireOrganizer,
-  bootstrapAdmin, publicAccount, roles, resetAccountPassword,
+  bootstrapAdmin, publicAccount, roles, resetAccountPassword, sendAccountWelcome,
 } = require("./auth.js");
 
 const app = express();
@@ -67,6 +67,46 @@ const registrationSchema = new mongoose.Schema(
 const Retreat = mongoose.model("Retreat", retreatSchema);
 const Registration = mongoose.model("Registration", registrationSchema);
 
+async function sendEmail(response, details) {
+  if (!details.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(details.email)) {
+    return response.status(400).json({ error: "Recipient must have a valid saved email address" });
+  }
+  const emailNotification = await sendWelcome(details);
+  return emailResponse(response, emailNotification);
+}
+
+function emailResponse(response, emailNotification) {
+  if (emailNotification.status === "disabled") {
+    return response.status(503).json({ error: "Email sending is disabled", emailNotification });
+  }
+  if (emailNotification.status === "failed") {
+    return response.status(502).json({ error: emailNotification.message, emailNotification });
+  }
+  if (emailNotification.status === "already_attempted") {
+    return response.status(409).json({
+      error: "Welcome email already attempted for this role, or account role changed",
+      emailNotification,
+    });
+  }
+  return response.json({ emailNotification });
+}
+
+app.get("/api/retreats/upcoming", async (_request, response) => {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date()).map(({ type, value }) => [type, value]));
+  const today = `${parts.year}-${parts.month}-${parts.day}`;
+  const retreats = await Retreat.find({
+    startDate: { $regex: "^\\d{4}-\\d{2}-\\d{2}$" },
+    endDate: { $gte: today },
+  }).select("_id name year startDate endDate venue").sort({ startDate: 1, name: 1 });
+  response.set("Cache-Control", "no-store");
+  response.json(retreats.map((retreat) => ({
+    _id: retreat._id, name: retreat.name, year: retreat.year,
+    startDate: retreat.startDate, endDate: retreat.endDate, venue: retreat.venue,
+  })));
+});
+
 app.get("/", (_request, response) => {
   response.send("Backend is running");
 });
@@ -111,6 +151,17 @@ app.get("/api/organizers", authenticate, requireAdmin, async (_request, response
 
 app.patch("/api/accounts/:accountId/password", authenticate, requireAdmin, resetAccountPassword);
 
+app.post("/api/accounts/:accountId/email", authenticate, requireAdmin, async (request, response) => {
+  if (!mongoose.isValidObjectId(request.params.accountId)) {
+    return response.status(400).json({ error: "Invalid account ID" });
+  }
+  const account = await Account.findById(request.params.accountId);
+  if (!account) {
+    return response.status(404).json({ error: "Account not found" });
+  }
+  return emailResponse(response, await sendAccountWelcome(account));
+});
+
 app.patch("/api/accounts/:accountId/role", authenticate, requireAdmin, async (request, response) => {
   if (!mongoose.isValidObjectId(request.params.accountId)) {
     return response.status(400).json({ error: "Invalid account ID" });
@@ -130,7 +181,8 @@ app.patch("/api/accounts/:accountId/role", authenticate, requireAdmin, async (re
   if (!account) {
     return response.status(404).json({ error: "Account not found" });
   }
-  response.json(publicAccount(account));
+  const emailNotification = role === "organizer" ? await sendAccountWelcome(account) : undefined;
+  response.json({ ...publicAccount(account), ...(emailNotification ? { emailNotification } : {}) });
 });
 
 app.get("/api/users", authenticate, requireOrganizer, async (_request, response) => {
@@ -138,6 +190,26 @@ app.get("/api/users", authenticate, requireOrganizer, async (_request, response)
     .populate("retreatId", "name year")
     .sort({ createdAt: -1 });
   response.json(registrations);
+});
+
+app.post("/api/users/:userId/email", authenticate, requireOrganizer, async (request, response) => {
+  if (!mongoose.isValidObjectId(request.params.userId)) {
+    return response.status(400).json({ error: "Invalid user ID" });
+  }
+  const registration = await Registration.findById(request.params.userId);
+  if (!registration) {
+    return response.status(404).json({ error: "User not found" });
+  }
+  const retreat = await Retreat.findById(registration.retreatId);
+  if (!retreat) {
+    return response.status(404).json({ error: "Retreat not found" });
+  }
+  return sendEmail(response, {
+    email: registration.email,
+    name: [registration.name, registration.middleName, registration.surname].filter(Boolean).join(" "),
+    kind: "registration",
+    retreat,
+  });
 });
 
 app.delete("/api/users/:userId", authenticate, requireAdmin, async (request, response) => {
@@ -159,12 +231,13 @@ app.get("/api/retreats", authenticate, requireOrganizer, async (_request, respon
 });
 
 app.post("/api/retreats", authenticate, requireAdmin, async (request, response) => {
+  const { name, year, startDate, endDate, venue } = request.body || {};
   const retreat = await Retreat.create({
-    name: request.body.name,
-    year: request.body.year,
-    startDate: request.body.startDate,
-    endDate: request.body.endDate,
-    venue: readquest.body.venue,
+    name,
+    year,
+    startDate,
+    endDate,
+    venue,
   });
   response.status(201).json(retreat);
 });
@@ -232,20 +305,13 @@ app.post("/api/retreats/:retreatId/registrations", authenticate, requireOrganize
       centerPayment: request.body.centerPayment,
       address: request.body.address,
     }], { session });
-    return { registration: created, retreat };
+    return created;
   });
   if (!result) {
     return response.status(404).json({ error: "Retreat not found" });
   }
 
-  const { registration, retreat } = result;
-  const emailNotification = await sendWelcome({
-    email: registration.email,
-    name: [registration.name, registration.middleName, registration.surname].filter(Boolean).join(" "),
-    kind: "registration",
-    retreat,
-  });
-  response.status(201).json({ ...registration.toObject(), emailNotification });
+  response.status(201).json(result);
 });
 
 app.get(

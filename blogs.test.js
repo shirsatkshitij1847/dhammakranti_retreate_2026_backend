@@ -63,10 +63,11 @@ test("MongoDB blog routes, uploads and author permissions (mocked database)", as
   });
   const base = `http://127.0.0.1:${server.address().port}/api/blogs`;
   const image = await sharp({ create: { width: 4, height: 4, channels: 3, background: "red" } }).png().toBuffer();
-  function form({ bytes = image, title = "Retreat story", text = "Text below the image", includeImage = true } = {}) {
+  function form({ bytes = image, title = "Retreat story", text = "Text below the image", includeImage = true, textFormat } = {}) {
     const data = new FormData();
     data.set("title", title);
     data.set("text", text);
+    if (textFormat !== undefined) data.set("textFormat", textFormat);
     if (includeImage) data.set("image", new Blob([bytes]), "photo.png");
     return data;
   }
@@ -88,6 +89,7 @@ test("MongoDB blog routes, uploads and author permissions (mocked database)", as
   const created = await request("", "POST", tokens[1], form());
   assert.equal(created.status, 201);
   const post = await created.json();
+  assert.equal(post.textFormat, "plain");
   assert.equal(post.title, "Retreat story");
   assert.equal(post.authorId, String(accounts[1]._id));
   assert.equal(post.image, undefined);
@@ -121,4 +123,47 @@ test("MongoDB blog routes, uploads and author permissions (mocked database)", as
   assert.equal(deleted.status, 204);
   assert.equal(records.size, 0);
   assert.equal((await request(`/${post._id}/image`)).status, 404);
+
+  const rich = await request("", "POST", tokens[1], form({
+    textFormat: "html",
+    text: '<h2>Heading</h2><p data-spacing="wide" onclick="bad()"><strong>Bold</strong> and <em>italic</em></p><ul><li>One</li></ul><blockquote>Peace</blockquote><script>bad()</script><img src=x onerror=bad()><iframe>bad</iframe>',
+  }));
+  const formatted = await rich.json();
+  assert.equal(rich.status, 201, JSON.stringify(formatted));
+  assert.equal(formatted.textFormat, "html");
+  assert.ok(formatted.text.includes('<p data-spacing="wide"><strong>Bold</strong>'));
+  assert.ok(formatted.text.includes("<em>italic</em>"));
+  assert.ok(formatted.text.includes("<ul><li>One</li></ul>"));
+  assert.ok(formatted.text.includes("<blockquote>Peace</blockquote>"));
+  assert.ok(!/script|onclick|img|iframe/.test(formatted.text));
+  const reloaded = await (await request(`/${formatted._id}`)).json();
+  assert.equal(reloaded.text, formatted.text);
+  const titleOnly = new FormData();
+  titleOnly.set("title", "Title only");
+  assert.equal((await request(`/${formatted._id}`, "PATCH", tokens[1], titleOnly)).status, 200);
+  assert.equal(records.get(formatted._id).text, formatted.text);
+  for (const bad of [
+    { textFormat: "markdown" },
+    { textFormat: "html", text: "<script>bad()</script>" },
+    { textFormat: "html", text: "<p>&nbsp;</p>" },
+    { textFormat: "html", text: `<p>${"a".repeat(20000)}</p>` },
+  ]) {
+    assert.equal((await request("", "POST", tokens[1], form(bad))).status, 400);
+  }
+  const formatOnly = new FormData();
+  formatOnly.set("textFormat", "plain");
+  assert.equal((await request(`/${formatted._id}`, "PATCH", tokens[1], formatOnly)).status, 400);
+  assert.equal((await request(`/${formatted._id}`, "PATCH", tokens[2], form({ textFormat: "html" }))).status, 403);
+  const cleaned = await request(`/${formatted._id}`, "PATCH", tokens[1], form({
+    includeImage: false, textFormat: "html", text: '<p data-spacing="evil" style="color:red">Clean</p>',
+  }));
+  assert.equal(cleaned.status, 200);
+  assert.equal((await cleaned.json()).text, "<p>Clean</p>");
+  const convert = await request(`/${formatted._id}`, "PATCH", tokens[1], form({
+    includeImage: false, textFormat: "plain", text: "<strong>Literal text</strong>",
+  }));
+  assert.equal(convert.status, 200);
+  const plain = await convert.json();
+  assert.equal(plain.textFormat, "plain");
+  assert.equal(plain.text, "<strong>Literal text</strong>");
 });

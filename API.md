@@ -116,6 +116,8 @@ grant account permissions.
 | Sign up / log in | Yes | Yes | Yes | Yes |
 | Read own account | No | Yes | Yes | Yes |
 | List participants | No | No | Yes | Yes |
+| Send a registered participant email | No | No | Yes | Yes |
+| Send an account welcome email | No | No | No | Yes |
 | Delete registrations | No | No | No | Yes |
 | Create retreats | No | No | No | Yes |
 | Delete retreats and all their registrations | No | No | No | Yes |
@@ -171,6 +173,10 @@ be unique. `role` may be omitted or `"visitor"`; other roles return `403`.
 
 Success: `201 Created`. Signup and login both return this shape:
 
+Signup saves the account, then automatically attempts an approval-pending welcome
+email. The response includes `emailNotification` (`sent`, `disabled`, or `failed`).
+Mail failure never undoes account creation; do not repeat signup to resend mail.
+
 ```json
 {
   "token": "<signed-access-token>",
@@ -198,6 +204,10 @@ Success: `200 OK`, with the same response shape as signup. Invalid credentials
 return `401`; missing/malformed credentials return `400`. Authentication
 requests share a limit of 20 attempts per IP per 15 minutes (`429` on excess).
 The limiter is in-memory per server process.
+An admin's first successful login attempts a one-time welcome email when mail
+is enabled. Admin login responses also include `emailNotification` with status
+`sent`, `failed`, `disabled`, or `already_attempted`. Email failure does not
+prevent login. Visitor and organizer logins never send emails.
 
 ### GET /api/auth/me
 
@@ -255,6 +265,9 @@ Role change request:
 Allowed roles: `visitor`, `organizer`, `admin`. Returns the updated account
 with status `200`. Invalid IDs/roles return `400`; missing accounts return
 `404`. An admin cannot remove their own admin role.
+Setting the role to `organizer` attempts its one-time welcome email when enabled;
+the response includes `emailNotification`. Approval remains successful if SMTP
+fails. Reapproval does not resend an already attempted organizer welcome.
 
 To create an organizer: create a visitor through signup, then use an admin
 token to promote its account `_id` through the PATCH endpoint.
@@ -287,7 +300,7 @@ Saved passwords cannot be retrieved; an admin can only replace them.
 
 ## Blog APIs (MongoDB Images)
 
-Each blog stores one image as binary data together with title, plain text,
+Each blog stores one image as binary data together with title, plain or formatted text,
 and author in MongoDB. No external storage, local image files, or additional
 environment variables are needed. Images are limited to 5 MB so documents stay
 below MongoDB's 16 MB limit. Include image storage in database backups/capacity.
@@ -307,6 +320,13 @@ Send a bearer token and `multipart/form-data`:
 
 - `title`: required on creation, non-blank, maximum 200 characters.
 - `text`: required on creation, non-blank, maximum 20,000 characters.
+- `textFormat`: optional `plain` (default for new/legacy posts) or `html`.
+  HTML supports paragraphs, bold, italic, H2/H3 headings, lists, and blockquotes.
+  Paragraphs may use `data-spacing="compact"`, `"normal"`, or `"wide"`.
+  Scripts, images, links, styles, and event handlers are stripped by the server.
+  HTML must have readable text; its markup counts towards the 20,000-character
+  limit. Send `text` whenever sending `textFormat`. On PATCH, omitted format
+  preserves the existing post's format.
 - `image`: required on creation; one JPEG, PNG, or WebP file, maximum 5 MB.
 
 PATCH accepts any of these fields but requires at least one. Authentication
@@ -353,8 +373,11 @@ Create returns `201`; edit/detail returns `200`, with this shape:
 List returns an array of the same objects, newest first; `[]` if empty.
 `page` defaults to 1; `limit` defaults to 10 and must be 1-50.
 Image bytes are excluded from JSON. `imageUrl` is an absolute URL built from
-`BACKEND_URL`; use it directly as the image source. Display text as plain text
-(not unsanitized HTML). All posts are immediately public, with no draft workflow.
+`BACKEND_URL`; use it directly as the image source. Responses include `textFormat`.
+Display absent/`plain` format as literal text. Only `html` format may be rendered
+as HTML, using an allowlist sanitizer on the client as well. All posts are
+immediately public, with no draft workflow. Publishing/ownership permissions
+are unchanged for formatted content.
 
 Delete returns `204` with no body and removes the blog and image together.
 Invalid inputs/IDs return `400`; missing posts return `404`; missing/invalid
@@ -362,6 +385,17 @@ login returns `401`; insufficient permissions return `403`; oversized images
 return `413`. Unexpected storage errors return `500`.
 
 ## Retreat and Account Endpoint Summary
+
+### Public upcoming retreat announcements
+
+`GET /api/retreats/upcoming` requires no login. It returns an array of
+`{ _id, name, year, startDate, endDate, venue }`, ordered by start date and name.
+Only dated retreats whose end date is today or later in `Asia/Kolkata` appear;
+ended and undated retreats are excluded. Responses use `Cache-Control: no-store`.
+No account, participant, payment, or internal registration data is public.
+The existing `GET /api/retreats` and registration endpoints remain protected.
+Home refreshes announcements every minute and on mounting after navigation;
+creating, editing, or deleting a retreat is reflected on the next refresh.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
@@ -460,8 +494,21 @@ Request body:
 
 Success: `201 Created`. Returns the saved retreat document, including `_id` and timestamps.
 
+Retreat creation is working after correcting the venue field access in the
+creation handler. Creation only saves the retreat; it does not send emails.
+Use the returned `_id` for participant registration and retreat updates.
+Refresh `GET /api/retreats` after creation to update the admin/organizer list.
+The public upcoming-retreat list includes it only when its saved dates meet
+that endpoint's upcoming/ongoing criteria.
+
 The same name/year combination must be unique. Different retreats can share a year.
 Use this endpoint for future years instead of creating a new database or collection.
+
+Creation troubleshooting:
+- `401`: log in and send the bearer token; `403`: the current account must be admin.
+- `400`: inspect the returned `error`; send JSON with name/year and valid paired dates.
+  An empty or missing request body returns a validation error, not a server error.
+- `409`: the same trimmed name and year already exist.
 
 ### Update retreat details
 
@@ -533,6 +580,8 @@ Success: `201 Created`. Example response:
 ```
 
 The retreat must exist. `retreatId` is taken from the URL, not the request body.
+Registration only saves the participant; it never sends email or returns
+`emailNotification`. Use the separate email endpoint below when needed.
 Repeated registrations are currently allowed, including the same mobile number.
 Each registration receives a unique MongoDB `_id`, independently of the phone number.
 This identifies a registration, not a person across retreats, and does not prevent
@@ -675,6 +724,8 @@ Errors use this JSON shape:
 | `409 Conflict` | Retreat name/year combination or account email already exists |
 | `429 Too Many Requests` | Authentication attempt limit exceeded |
 | `500 Internal Server Error` | Unexpected server error |
+| `502 Bad Gateway` | Explicit email request failed due to SMTP/configuration error |
+| `503 Service Unavailable` | Explicit email request made while email sending is disabled |
 
 Validation error messages describe the failing fields. Unknown routes use
 Express's default 404 response rather than the JSON error shape above.
@@ -689,6 +740,8 @@ Express's default 404 response rather than the JSON error shape above.
 5. Treat `201 Created` as successful registration; display the returned error otherwise.
 6. Use `GET /api/users` to view all registrations with retreat details, or
    `GET /api/retreats/<selected-id>/registrations` for one retreat only.
+7. Only when requested, call `POST /api/users/<registration-id>/email` to send
+   the participant's confirmation. No email is sent by step 4.
 
 For another retreat or year, create it through `POST /api/retreats`, then use its
 `_id` for registration. Delete a registration with `DELETE /api/users/<registration-id>`.
@@ -705,22 +758,68 @@ Use an app password, not the normal Gmail account password. Never use `VITE_`
 variables for mail credentials. Deploy the `mail-assets/` directory alongside `mail.js`.
 Email is disabled by default; restart the backend after configuring it.
 
-- New account signup sends a personalized welcome/approval-pending message.
-- An admin or organizer's first successful login while mail is enabled claims a persistent
-  `welcomeEmailAttemptedAt` marker and attempts a welcome email once. Concurrent
-  logins do not send duplicates. Failed attempts are logged and surfaced; automatic
-  retries are not implemented. Existing admin/organizer accounts without the marker
-  receive it on their next login. This is once per account, not once per role:
-  promoting an organizer to admin does not send another first-login email.
-  Organizer messages welcome the approved team member; signup messages remain
-  approval-pending. Logins while mail is disabled do not consume the marker.
-- Retreat registration sends a confirmation only when an email was provided, after
-  the database transaction commits (never inside a transaction retry).
-  This separate participant message includes their full name, a heartfelt welcome,
-  the saved retreat name/year, inclusive start/end dates, and venue in both HTML
-  and plain text. Details come from the selected retreat, not registration input.
-  Missing dates/venue say "To be confirmed by the organizer"; no details are invented.
-  This confirms registration, not attendance or payment. SMTP must still be enabled.
+- Admin: a welcome email is attempted on the first successful admin login with
+  mail enabled.
+- Organizer: a welcome email is attempted when an admin sets the account role
+  to `organizer`, not on login.
+- Visitor: login-account signup sends an approval-pending email automatically.
+  Retreat participant registration never sends automatic emails.
+  Visitor emails can be sent manually any time.
+
+Admin and organizer emails each have their own persistent attempt marker:
+`adminWelcomeEmailAttemptedAt` and `organizerWelcomeEmailAttemptedAt`.
+Atomic claims prevent duplicates across concurrent login, approval, and manual
+requests. Demotion/reapproval and server restarts do not reset these markers.
+Disabled mail does not consume an attempt. SMTP failures are logged and surfaced,
+but consume the one-time attempt to avoid duplicate delivery after ambiguous SMTP
+failures; they cannot be retried through the API. Accounts without the new
+role-specific markers are eligible for one attempt per role; the older shared
+`welcomeEmailAttemptedAt` field is not used.
+
+### POST /api/users/:userId/email
+
+Requires an organizer or admin token. Sends a confirmation to an existing retreat
+participant identified by the registration `_id` from `/api/users` or the
+registration creation response. No request body is required. The recipient and
+full name come from the saved registration; the current retreat name/year, dates,
+and venue come from its saved retreat. Request body overrides are ignored.
+Missing dates/venue say "To be confirmed by the organizer".
+This confirms registration, not attendance or payment.
+
+### POST /api/accounts/:accountId/email
+
+Requires an admin token. Sends a welcome message to an existing login account.
+No request body is required. The recipient, name, and current role come from the
+saved account, not the request body. Visitors receive an approval-pending message;
+organizers and admins receive their respective welcome messages. For admins and
+organizers this shares the same once-per-role attempt marker as automatic sending;
+repeat attempts return `409` and never resend. Visitor account emails are repeatable.
+
+Both endpoints return `200` only when SMTP accepts the recipient:
+
+```json
+{ "emailNotification": { "status": "sent" } }
+```
+
+`sent` means SMTP accepted the message, not guaranteed inbox delivery.
+Errors return `{ "error": "..." }`, plus `emailNotification` for SMTP outcomes:
+
+| Status | Meaning |
+| ------ | ------- |
+| `400` | Invalid ID, or missing/invalid saved recipient email |
+| `401/403` | Missing/invalid token or insufficient permissions |
+| `404` | Account, registration, or associated retreat not found |
+| `409` | Admin/organizer welcome already attempted for this role, or role changed during sending; `emailNotification.status` is `already_attempted` |
+| `503` | Email disabled; `emailNotification.status` is `disabled` |
+| `502` | SMTP/configuration failure; `emailNotification.status` is `failed`, with a safe `message`; failure is logged |
+
+These requests never create registrations/accounts. Admin/organizer welcome
+requests only update the attempt marker. Visitor email requests are repeatable
+and do not modify records. On visitor email failure, retry the email endpoint,
+not signup or registration. No automatic retries are used.
+The frontend should offer a separate **Send email** action and prevent duplicate
+clicks while a request is pending.
+
 - HTML includes embedded logo/Buddha/stupa artwork, a plain-text alternative,
   copyright, the Triratna Youth Akola YouTube link, and a "Stay connected with
   Dhammakranti" link to `https://dhammakranti.triratnaakolayouth.com` in both HTML
@@ -732,9 +831,5 @@ Email is disabled by default; restart the backend after configuring it.
   support for CSS masks or blend modes. Deploy this asset with the other artwork.
   Email clients that do not
   support background images show the solid-color fallback.
-- Signup, first-admin/organizer-login attempts, and registration responses include `emailNotification`
-  with `status`: `sent` (SMTP accepted, not a delivery guarantee), `disabled`,
-  `skipped` (no email), or `failed` with a safe message. Saving/login remains successful
-  when SMTP fails. Do not retry registration just because an email failed.
 - Delivery is synchronous with bounded SMTP timeouts; no durable queue/retry system
   is provided. Passwords and tokens are never included in the email.

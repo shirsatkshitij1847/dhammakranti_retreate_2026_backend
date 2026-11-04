@@ -87,18 +87,20 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     return account;
   });
   t.mock.method(Account, "findById", async (id) => accounts.get(String(id)) || null);
+  t.mock.method(Account, "findOneAndUpdate", async (filter, update, options) => {
+    assert.equal(options.new, true);
+    const marker = Object.keys(update.$set)[0];
+    assert.ok(["adminWelcomeEmailAttemptedAt", "organizerWelcomeEmailAttemptedAt"].includes(marker));
+    assert.deepEqual(filter[marker], { $exists: false });
+    const account = accounts.get(String(filter._id));
+    if (!account || account.role !== filter.role || account[marker]) return null;
+    Object.assign(account, update.$set);
+    return account;
+  });
   t.mock.method(Account, "findOneAndDelete", async ({ _id, role }) => {
     const account = accounts.get(String(_id));
     if (!account || account.role !== role) return null;
     accounts.delete(String(_id));
-    return account;
-  });
-  t.mock.method(Account, "findOneAndUpdate", async (filter, update, options) => {
-    assert.deepEqual(filter.welcomeEmailAttemptedAt, { $exists: false });
-    assert.equal(options.new, true);
-    const account = accounts.get(String(filter._id));
-    if (!account || account.welcomeEmailAttemptedAt) return null;
-    Object.assign(account, update.$set);
     return account;
   });
   t.mock.method(Account, "findOne", ({ email }) => {
@@ -141,6 +143,8 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     assert.deepEqual(update, { $inc: { registrationVersion: 1 } });
     return retreats.get(String(id)) || null;
   });
+  t.mock.method(Retreat, "findById", async (id) => retreats.get(String(id)) || null);
+  t.mock.method(Registration, "findById", async (id) => registrations.get(String(id)) || null);
   t.mock.method(Retreat, "findByIdAndDelete", async (id, options) => {
     assert.equal(options.session, session);
     const row = retreats.get(String(id));
@@ -251,8 +255,7 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     visitor = data.account;
     assert.equal(data.emailNotification.status, "sent");
     assert.equal(sentMail.length, 1);
-    assert.equal(sentMail[0].to, visitor.email);
-    assert.ok(sentMail[0].text.includes("admin approval"));
+    assert.equal(sentMail[0].to, "visitor@example.com");
     visitorToken = data.token;
     assert.equal(visitor.role, "visitor");
     assert.equal(visitor.email, "visitor@example.com");
@@ -313,12 +316,10 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     await assert.rejects(bootstrapAdmin(), /non-admin/);
   });
 
-  await t.test("concurrent later admin logins do not repeat the welcome email", async () => {
+  await t.test("subsequent concurrent admin logins never repeat welcome emails", async () => {
     const before = sentMail.length;
     await Promise.all([login("admin@example.com"), login("admin@example.com")]);
     assert.equal(sentMail.length, before);
-    const admin = [...accounts.values()].find((row) => row.role === "admin");
-    assert.ok(admin.welcomeEmailAttemptedAt instanceof Date);
   });
 
   const protectedRoutes = [
@@ -335,6 +336,8 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     ["/api/organizers", "GET"],
     [`/api/accounts/${visitor?._id}/role`, "PATCH"],
     [`/api/accounts/${visitor?._id}/password`, "PATCH"],
+    [`/api/accounts/${visitor?._id}/email`, "POST"],
+    ["/api/users/690000000000000000000002/email", "POST"],
   ];
   await t.test("protected APIs reject anonymous and visitor access before querying registrations", async () => {
     for (const [path, method] of protectedRoutes) {
@@ -375,38 +378,33 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
   });
 
   let participantId;
-  await t.test("registration stays saved on mail failure and cannot assign account privileges", async (t) => {
+  await t.test("registration never sends mail and cannot assign account privileges", async () => {
     const fields = {
       name: "Sample", middleName: " Middle ", surname: "Participant",
       mobileNumber: "9000000000", center: "Akola", centerPayment: "500", address: "Akola",
       email: "participant@example.com",
     };
     const path = `/api/retreats/${retreat._id}/registrations`;
+    const before = sentMail.length;
     failMail = true;
-    t.mock.method(console, "error", () => {});
     const response = await request(path, { method: "POST", token: adminToken, body: fields });
     failMail = false;
     assert.equal(response.status, 201);
     const data = await response.json();
     participantId = data._id;
-    assert.equal(data.emailNotification.status, "failed");
+    assert.equal(data.emailNotification, undefined);
     assert.ok(registrations.has(participantId));
-    assert.equal(sentMail.at(-1).to, fields.email);
-    assert.ok(sentMail.at(-1).text.includes("Sample Middle Participant"));
-    assert.ok(sentMail.at(-1).text.includes("Retreat: Retreat"));
-    assert.ok(sentMail.at(-1).text.includes("3 November 2026"));
-    assert.ok(sentMail.at(-1).text.includes("7 November 2026"));
-    assert.ok(sentMail.at(-1).text.includes("Akola Retreat Centre"));
+    assert.equal(sentMail.length, before);
     const success = await request(path, { method: "POST", token: adminToken, body: fields });
     const successData = await success.json();
     assert.equal(success.status, 201);
-    assert.equal(successData.emailNotification.status, "sent");
+    assert.equal(successData.emailNotification, undefined);
     registrations.delete(successData._id);
     const count = sentMail.length;
     const noEmail = await request(path, { method: "POST", token: adminToken, body: { ...fields, email: "" } });
     const noEmailData = await noEmail.json();
     assert.equal(noEmail.status, 201);
-    assert.equal(noEmailData.emailNotification.status, "skipped");
+    assert.equal(noEmailData.emailNotification, undefined);
     assert.equal(sentMail.length, count);
     registrations.delete(noEmailData._id);
     assert.equal(data.role, "visitor");
@@ -414,6 +412,59 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     const elevated = await request(path, { method: "POST", token: adminToken, body: { ...fields, role: "admin" } });
     assert.equal(elevated.status, 400);
     assert.equal(accounts.size, 2);
+  });
+
+  await t.test("visitor emails are explicitly sent using saved registration and retreat details", async (t) => {
+    const path = `/api/users/${participantId}/email`;
+    const registration = registrations.get(participantId);
+    const count = registrations.size;
+    const before = sentMail.length;
+    const sent = await request(path, {
+      method: "POST", token: adminToken,
+      body: { email: "override@example.test", name: "Override", retreat: { name: "Override" } },
+    });
+    assert.equal(sent.status, 200);
+    assert.deepEqual(await sent.json(), { emailNotification: { status: "sent" } });
+    assert.equal(sentMail.length, before + 1);
+    assert.equal(sentMail.at(-1).to, registration.email);
+    for (const text of ["Sample Middle Participant", "Retreat: Retreat", "3 November 2026", "7 November 2026", "Akola Retreat Centre"]) {
+      assert.ok(sentMail.at(-1).text.includes(text));
+    }
+    assert.equal((await request("/api/users/invalid/email", { method: "POST", token: adminToken })).status, 400);
+    assert.equal((await request(`/api/users/${new mongoose.Types.ObjectId()}/email`, {
+      method: "POST", token: adminToken,
+    })).status, 404);
+    const savedEmail = registration.email;
+    for (const email of [undefined, "", "invalid-email"]) {
+      registration.email = email;
+      assert.equal((await request(path, { method: "POST", token: adminToken })).status, 400);
+    }
+    registration.email = savedEmail;
+    const savedRetreatId = registration.retreatId;
+    registration.retreatId = new mongoose.Types.ObjectId();
+    assert.equal((await request(path, { method: "POST", token: adminToken })).status, 404);
+    registration.retreatId = savedRetreatId;
+    process.env.MAIL_ENABLED = "false";
+    const disabled = await request(path, { method: "POST", token: adminToken });
+    assert.equal(disabled.status, 503);
+    assert.equal((await disabled.json()).emailNotification.status, "disabled");
+    process.env.MAIL_ENABLED = "true";
+    assert.equal(sentMail.length, before + 1);
+    failMail = true;
+    const log = t.mock.method(console, "error", () => {});
+    const failed = await request(path, { method: "POST", token: adminToken });
+    failMail = false;
+    assert.equal(failed.status, 502);
+    assert.equal((await failed.json()).emailNotification.status, "failed");
+    assert.equal(log.mock.callCount(), 1);
+    const retry = await request(path, { method: "POST", token: adminToken });
+    assert.equal(retry.status, 200);
+    assert.equal(registrations.size, count);
+    assert.equal(sentMail.length, before + 3);
+    const resend = await request(path, { method: "POST", token: adminToken });
+    assert.equal(resend.status, 200);
+    assert.equal((await resend.json()).emailNotification.status, "sent");
+    assert.equal(sentMail.length, before + 4);
   });
 
   await t.test("admins can save retreat dates and venue; invalid dates and other roles are rejected", async () => {
@@ -453,7 +504,14 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     for (const role of ["organizer", "admin", "visitor"]) {
       const changed = await request(path, { method: "PATCH", token: adminToken, body: { role } });
       assert.equal(changed.status, 200);
-      assert.equal((await changed.json()).role, role);
+      const changedData = await changed.json();
+      assert.equal(changedData.role, role);
+      if (role === "organizer") {
+        assert.equal(changedData.emailNotification.status, "sent");
+        assert.ok(sentMail.at(-1).text.includes("organization team"));
+      } else {
+        assert.equal(changedData.emailNotification, undefined);
+      }
       const profile = await request("/api/profile", { token: visitorToken });
       assert.equal(profile.status, 200);
       assert.deepEqual(await profile.json(), { ...visitor, role });
@@ -469,6 +527,7 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
           ["/api/organizers", "GET"],
           [path, "PATCH"],
           [`/api/accounts/${visitor._id}/password`, "PATCH"],
+          [`/api/accounts/${visitor._id}/email`, "POST"],
           ["/api/retreats", "POST"],
           [`/api/retreats/${retreat._id}`, "DELETE"],
           [`/api/users/${participantId}`, "DELETE"],
@@ -477,6 +536,11 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
             method, token: visitorToken, body: method === "GET" ? undefined : { role: "admin" },
           })).status, 403);
         }
+        const visitorMail = await request(`/api/users/${participantId}/email`, {
+          method: "POST", token: visitorToken,
+        });
+        assert.equal(visitorMail.status, 200);
+        assert.equal((await visitorMail.json()).emailNotification.status, "sent");
         const registration = await request(`/api/retreats/${retreat._id}/registrations`, {
           method: "POST", token: visitorToken,
           body: {
@@ -510,6 +574,63 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     const all = await request("/api/accounts", { token: adminToken });
     assert.equal(all.status, 200);
     assert.equal(JSON.stringify(await all.json()).includes("passwordHash"), false);
+  });
+
+  await t.test("retreat creation returns saved fields and handles invalid bodies and duplicate retreats", async (t) => {
+    const saved = new Map();
+    t.mock.method(Retreat, "create", async (values) => {
+      const document = new Retreat(values);
+      await document.validate();
+      const key = `${document.name}:${document.year}`;
+      if (saved.has(key)) {
+        throw Object.assign(new Error("Duplicate retreat"), { code: 11000, keyPattern: { name: 1, year: 1 } });
+      }
+      saved.set(key, document);
+      return document;
+    });
+    t.mock.method(Retreat, "find", () => ({
+      sort() { return Promise.resolve([...saved.values()]); },
+    }));
+    const fields = {
+      name: " New Winter Retreat ", year: 2027, startDate: "2027-01-03",
+      endDate: "2027-01-07", venue: " Retreat Centre, Akola ",
+    };
+    const before = sentMail.length;
+    const created = await request("/api/retreats", { method: "POST", token: adminToken, body: fields });
+    assert.equal(created.status, 201);
+    const data = await created.json();
+    assert.ok(mongoose.isValidObjectId(data._id));
+    assert.equal(data.name, fields.name.trim());
+    assert.equal(data.year, fields.year);
+    assert.equal(data.startDate, fields.startDate);
+    assert.equal(data.endDate, fields.endDate);
+    assert.equal(data.venue, fields.venue.trim());
+    const listed = await request("/api/retreats", { token: adminToken });
+    assert.equal(listed.status, 200);
+    assert.deepEqual(await listed.json(), [data]);
+    const duplicate = await request("/api/retreats", { method: "POST", token: adminToken, body: fields });
+    assert.equal(duplicate.status, 409);
+    assert.equal((await duplicate.json()).error, "Retreat already exists");
+    for (const body of [
+      undefined, null, {}, { ...fields, name: " " }, { ...fields, year: 1999 },
+      { ...fields, year: 2027.5 }, { ...fields, startDate: "2027-02-30" },
+      { ...fields, endDate: "" }, { ...fields, endDate: "2027-01-01" },
+      { ...fields, venue: "a".repeat(301) },
+    ]) {
+      const invalid = await request("/api/retreats", { method: "POST", token: adminToken, body });
+      assert.equal(invalid.status, 400);
+      assert.equal(typeof (await invalid.json()).error, "string");
+    }
+    assert.equal(saved.size, 1);
+    const minimal = await request("/api/retreats", {
+      method: "POST", token: adminToken, body: { name: "Undated Retreat", year: 2028 },
+    });
+    assert.equal(minimal.status, 201);
+    const minimalData = await minimal.json();
+    assert.equal(minimalData.startDate, "");
+    assert.equal(minimalData.endDate, "");
+    assert.equal(minimalData.venue, "");
+    assert.equal(sentMail.length, before);
   });
 
   await t.test("admin deletion removes only a registration, not its account", async () => {
@@ -616,7 +737,7 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     assert.equal((await request("/api/accounts", { token: adminToken })).status, 200);
   });
 
-  await t.test("organizer first login sends once after approval, not during disabled or invalid logins", async (t) => {
+  await t.test("organizer logins never send mail; promotion to admin enables one admin welcome", async (t) => {
     // Give the additional login coverage a fresh 15-minute rate-limit window.
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 16 * 60 * 1000 });
     const account = await Account.create({
@@ -629,10 +750,8 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
         method: "POST", body: { email: account.email, password: "wrong-password" },
       });
       assert.equal(invalid.status, 401);
-      assert.equal(account.welcomeEmailAttemptedAt, undefined);
       process.env.MAIL_ENABLED = "false";
       await login(account.email);
-      assert.equal(account.welcomeEmailAttemptedAt, undefined);
       assert.equal(sentMail.length, before);
       process.env.MAIL_ENABLED = "true";
       const responses = await Promise.all([1, 2].map(() => request("/api/auth/login", {
@@ -640,12 +759,12 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
       })));
       assert.ok(responses.every((response) => response.status === 200));
       const results = await Promise.all(responses.map((response) => response.json()));
-      assert.equal(results.filter((result) => result.emailNotification?.status === "sent").length, 1);
-      assert.equal(sentMail.length, before + 1);
-      assert.equal(sentMail.at(-1).to, account.email);
-      assert.ok(sentMail.at(-1).text.includes("organization team"));
-      assert.ok(account.welcomeEmailAttemptedAt instanceof Date);
+      assert.ok(results.every((result) => result.emailNotification === undefined));
+      assert.equal(sentMail.length, before);
       account.role = "admin";
+      await login(account.email);
+      assert.equal(sentMail.length, before + 1);
+      assert.ok(account.adminWelcomeEmailAttemptedAt instanceof Date);
       await login(account.email);
       assert.equal(sentMail.length, before + 1);
     } finally {
@@ -654,33 +773,145 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     }
   });
 
-  await t.test("first team login remains successful on mail failure and does not repeat the attempt", async (t) => {
+  await t.test("admin welcome emails are claimed once across first login and manual requests", async (t) => {
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 32 * 60 * 1000 });
     t.mock.method(console, "error", () => {});
-    for (const role of ["admin", "organizer"]) {
+    assert.equal((await request("/api/accounts/invalid/email", { method: "POST", token: adminToken })).status, 400);
+    assert.equal((await request(`/api/accounts/${new mongoose.Types.ObjectId()}/email`, {
+      method: "POST", token: adminToken,
+    })).status, 404);
+    for (const role of ["visitor", "admin", "organizer"]) {
       const account = await Account.create({
         name: "New Team Member", email: `new-${role}@example.test`, role,
         passwordHash: [...accounts.values()].find((row) => row.role === "admin").passwordHash,
       });
       try {
+        const path = `/api/accounts/${account._id}/email`;
         const before = sentMail.length;
         failMail = true;
-        const response = await request("/api/auth/login", {
-          method: "POST", body: { email: account.email, password },
-        });
-        assert.equal(response.status, 200);
-        const data = await response.json();
-        assert.equal(data.emailNotification.status, "failed");
-        assert.ok(data.token);
-        assert.equal(data.account.role, role);
-        assert.ok(account.welcomeEmailAttemptedAt instanceof Date);
+        const failed = await request(path, { method: "POST", token: adminToken });
+        assert.equal(failed.status, 502);
+        assert.equal((await failed.json()).emailNotification.status, "failed");
         failMail = false;
-        await login(account.email);
-        assert.equal(sentMail.length, before + 1);
+        const sent = await request(path, {
+          method: "POST", token: adminToken, body: { email: "override@example.test", role: "admin" },
+        });
+        assert.equal(sent.status, role === "visitor" ? 200 : 409);
+        assert.equal((await sent.json()).emailNotification.status, role === "visitor" ? "sent" : "already_attempted");
+        assert.equal(sentMail.length, before + (role === "visitor" ? 2 : 1));
+        assert.equal(sentMail.at(-1).to, account.email);
+        assert.ok(sentMail.at(-1).text.includes(
+          role === "visitor" ? "admin approval" : role === "admin" ? "administrator" : "organization team",
+        ));
+        assert.ok(!sentMail.at(-1).text.includes("first visit"));
+        assert.ok(!sentMail.at(-1).text.includes(password));
+        process.env.MAIL_ENABLED = "false";
+        const disabled = await request(path, { method: "POST", token: adminToken });
+        assert.equal(disabled.status, 503);
+        assert.equal((await disabled.json()).emailNotification.status, "disabled");
+        assert.equal(sentMail.length, before + (role === "visitor" ? 2 : 1));
       } finally {
+        process.env.MAIL_ENABLED = "true";
         failMail = false;
         accounts.delete(String(account._id));
       }
+    }
+  });
+
+  await t.test("concurrent first admin logins and manual sending share one persistent claim", async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 48 * 60 * 1000 });
+    const account = await Account.create({
+      name: "First Admin", email: "first-admin@example.test", role: "admin",
+      passwordHash: [...accounts.values()].find((row) => row.role === "admin").passwordHash,
+    });
+    const before = sentMail.length;
+    process.env.MAIL_ENABLED = "false";
+    const disabled = await request("/api/auth/login", {
+      method: "POST", body: { email: account.email, password },
+    });
+    assert.equal(disabled.status, 200);
+    assert.equal((await disabled.json()).emailNotification.status, "disabled");
+    assert.equal(account.adminWelcomeEmailAttemptedAt, undefined);
+    process.env.MAIL_ENABLED = "true";
+    const invalid = await request("/api/auth/login", {
+      method: "POST", body: { email: account.email, password: "wrong-password" },
+    });
+    assert.equal(invalid.status, 401);
+    assert.equal(account.adminWelcomeEmailAttemptedAt, undefined);
+    const responses = await Promise.all([
+      request("/api/auth/login", { method: "POST", body: { email: account.email, password } }),
+      request("/api/auth/login", { method: "POST", body: { email: account.email, password } }),
+      request(`/api/accounts/${account._id}/email`, { method: "POST", token: adminToken }),
+    ]);
+    const results = await Promise.all(responses.map((response) => response.json()));
+    assert.equal(results.filter((result) => result.emailNotification.status === "sent").length, 1);
+    assert.equal(results.filter((result) => result.emailNotification.status === "already_attempted").length, 2);
+    assert.equal(sentMail.length, before + 1);
+    assert.ok(account.adminWelcomeEmailAttemptedAt instanceof Date);
+    accounts.delete(String(account._id));
+  });
+
+  await t.test("first admin login succeeds on SMTP failure without repeating its attempt", async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 56 * 60 * 1000 });
+    t.mock.method(console, "error", () => {});
+    const account = await Account.create({
+      name: "Failed Admin", email: "failed-admin@example.test", role: "admin",
+      passwordHash: [...accounts.values()].find((row) => row.role === "admin").passwordHash,
+    });
+    const before = sentMail.length;
+    failMail = true;
+    const response = await request("/api/auth/login", {
+      method: "POST", body: { email: account.email, password },
+    });
+    failMail = false;
+    assert.equal(response.status, 200);
+    const data = await response.json();
+    assert.ok(data.token);
+    assert.equal(data.emailNotification.status, "failed");
+    assert.ok(account.adminWelcomeEmailAttemptedAt instanceof Date);
+    await login(account.email);
+    const manual = await request(`/api/accounts/${account._id}/email`, { method: "POST", token: adminToken });
+    assert.equal(manual.status, 409);
+    assert.equal(sentMail.length, before + 1);
+    accounts.delete(String(account._id));
+  });
+
+  await t.test("organizer approval sends only once per role, including after demotion and reapproval", async (t) => {
+    t.mock.method(console, "error", () => {});
+    for (const fail of [false, true]) {
+      const account = await Account.create({
+        name: "Pending Organizer", email: `approve-${fail}@example.test`, role: "visitor",
+        passwordHash: "test-only-hash",
+      });
+      const path = `/api/accounts/${account._id}/role`;
+      const before = sentMail.length;
+      process.env.MAIL_ENABLED = "false";
+      const disabled = await request(path, { method: "PATCH", token: adminToken, body: { role: "organizer" } });
+      assert.equal(disabled.status, 200);
+      assert.equal((await disabled.json()).emailNotification.status, "disabled");
+      assert.equal(account.organizerWelcomeEmailAttemptedAt, undefined);
+      process.env.MAIL_ENABLED = "true";
+      failMail = fail;
+      const responses = await Promise.all([1, 2].map(() =>
+        request(path, { method: "PATCH", token: adminToken, body: { role: "organizer" } })));
+      const results = await Promise.all(responses.map((response) => response.json()));
+      assert.ok(responses.every((response) => response.status === 200));
+      assert.equal(results.filter((result) => result.emailNotification.status === (fail ? "failed" : "sent")).length, 1);
+      assert.equal(results.filter((result) => result.emailNotification.status === "already_attempted").length, 1);
+      failMail = false;
+      assert.equal(sentMail.length, before + 1);
+      assert.ok(account.organizerWelcomeEmailAttemptedAt instanceof Date);
+      await request(path, { method: "PATCH", token: adminToken, body: { role: "visitor" } });
+      await request(path, { method: "PATCH", token: adminToken, body: { role: "organizer" } });
+      const duplicate = await request(`/api/accounts/${account._id}/email`, { method: "POST", token: adminToken });
+      assert.equal(duplicate.status, 409);
+      assert.equal(sentMail.length, before + 1);
+      await request(path, { method: "PATCH", token: adminToken, body: { role: "admin" } });
+      const adminMail = await request(`/api/accounts/${account._id}/email`, { method: "POST", token: adminToken });
+      assert.equal(adminMail.status, 200);
+      assert.ok(account.adminWelcomeEmailAttemptedAt instanceof Date);
+      assert.equal(sentMail.length, before + 2);
+      accounts.delete(String(account._id));
     }
   });
 
