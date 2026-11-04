@@ -510,6 +510,24 @@ Creation troubleshooting:
   An empty or missing request body returns a validation error, not a server error.
 - `409`: the same trimmed name and year already exist.
 
+### Local creation verification
+
+Verified against the running backend at `http://localhost:7004` on November 4, 2026:
+
+| Check | Result |
+| ----- | ------ |
+| Admin creates a retreat with name, year, dates, and venue | `201`; saved fields, `_id`, and timestamps verified |
+| Read the created retreat through `GET /api/retreats` | Saved retreat present with the expected venue |
+| Repeat the same name/year | `409` |
+| Missing body/required fields, invalid year/date, or reversed dates | `400` |
+| Create without authentication | `401` |
+| Delete the temporary verification retreat | `204` |
+
+The creation handler no longer contains the old `readquest.body.venue` typo.
+All 26 authentication/API regression tests passed, including creation and
+permission checks. These results verify the local backend, not the deployed
+production version.
+
 ### Update retreat details
 
 **PATCH /api/retreats/:retreatId** requires an admin token and the same complete
@@ -765,6 +783,12 @@ Email is disabled by default; restart the backend after configuring it.
 - Visitor: login-account signup sends an approval-pending email automatically.
   Retreat participant registration never sends automatic emails.
   Visitor emails can be sent manually any time.
+
+Participant registration is save-only regardless of `MAIL_ENABLED`. The backend
+does not call the mail service from the registration handler. Frontend individual
+and bulk email actions must explicitly call `POST /api/users/:userId/email`
+(once per selected registration for bulk sending); there is no dedicated bulk
+email endpoint. Do not invoke this email action automatically after saving.
 
 Admin and organizer emails each have their own persistent attempt marker:
 `adminWelcomeEmailAttemptedAt` and `organizerWelcomeEmailAttemptedAt`.

@@ -13,12 +13,13 @@ process.env.FRONTEND_URL = "https://frontend.example.test";
 process.env.BACKEND_URL = "https://backend.example.test";
 process.env.MAIL_ENABLED = "false";
 
-const app = require("./index");
-const { Account, bootstrapAdmin } = require("./auth");
-const Registration = mongoose.model("Registration");
-const Retreat = mongoose.model("Retreat");
-
 test("authentication, permissions and existing APIs (mocked MongoDB)", async (t) => {
+  const mailService = require("./mail");
+  const welcomeSpy = t.mock.method(mailService, "sendWelcome");
+  const app = require("./index");
+  const { Account, bootstrapAdmin } = require("./auth");
+  const Registration = mongoose.model("Registration");
+  const Retreat = mongoose.model("Retreat");
   const accounts = new Map();
   const registrations = new Map();
   const retreat = {
@@ -386,6 +387,7 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     };
     const path = `/api/retreats/${retreat._id}/registrations`;
     const before = sentMail.length;
+    const mailCallsBefore = welcomeSpy.mock.callCount();
     failMail = true;
     const response = await request(path, { method: "POST", token: adminToken, body: fields });
     failMail = false;
@@ -412,6 +414,18 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     const elevated = await request(path, { method: "POST", token: adminToken, body: { ...fields, role: "admin" } });
     assert.equal(elevated.status, 400);
     assert.equal(accounts.size, 2);
+    assert.equal(welcomeSpy.mock.callCount(), mailCallsBefore);
+    process.env.MAIL_ENABLED = "false";
+    try {
+      const disabled = await request(path, { method: "POST", token: adminToken, body: fields });
+      assert.equal(disabled.status, 201);
+      const disabledData = await disabled.json();
+      assert.equal(disabledData.emailNotification, undefined);
+      registrations.delete(disabledData._id);
+      assert.equal(welcomeSpy.mock.callCount(), mailCallsBefore);
+    } finally {
+      process.env.MAIL_ENABLED = "true";
+    }
   });
 
   await t.test("visitor emails are explicitly sent using saved registration and retreat details", async (t) => {
@@ -419,12 +433,14 @@ test("authentication, permissions and existing APIs (mocked MongoDB)", async (t)
     const registration = registrations.get(participantId);
     const count = registrations.size;
     const before = sentMail.length;
+    const mailCallsBefore = welcomeSpy.mock.callCount();
     const sent = await request(path, {
       method: "POST", token: adminToken,
       body: { email: "override@example.test", name: "Override", retreat: { name: "Override" } },
     });
     assert.equal(sent.status, 200);
     assert.deepEqual(await sent.json(), { emailNotification: { status: "sent" } });
+    assert.equal(welcomeSpy.mock.callCount(), mailCallsBefore + 1);
     assert.equal(sentMail.length, before + 1);
     assert.equal(sentMail.at(-1).to, registration.email);
     for (const text of ["Sample Middle Participant", "Retreat: Retreat", "3 November 2026", "7 November 2026", "Akola Retreat Centre"]) {
